@@ -138,6 +138,11 @@ public class ZipFile implements Closeable {
     private final boolean useUnicodeExtraFields;
 
     /**
+     * Do not go through whole file reading out extra information. Less information but faster for
+     * large files.
+     */
+    private final boolean readOnlyCentralDirectory;
+    /**
      * Whether the file is closed.
      */
     private volatile boolean closed = true;
@@ -216,7 +221,7 @@ public class ZipFile implements Closeable {
     public ZipFile(final File f, final String encoding, final boolean useUnicodeExtraFields)
         throws IOException {
         this(Files.newByteChannel(f.toPath(), EnumSet.of(StandardOpenOption.READ)),
-             f.getAbsolutePath(), encoding, useUnicodeExtraFields, true);
+             f.getAbsolutePath(), encoding, useUnicodeExtraFields, true, false);
     }
 
     /**
@@ -277,23 +282,51 @@ public class ZipFile implements Closeable {
     public ZipFile(final SeekableByteChannel channel, final String archiveName,
                    final String encoding, final boolean useUnicodeExtraFields)
         throws IOException {
-        this(channel, archiveName, encoding, useUnicodeExtraFields, false);
+        this(channel, archiveName, encoding, useUnicodeExtraFields, false, false);
+    }
+
+    /**
+     * Opens the given channel for reading, assuming the specified
+     * encoding for file names.
+     *
+     * <p>{@link
+     * org.apache.commons.compress.utils.SeekableInMemoryByteChannel}
+     * allows you to read from an in-memory archive.</p>
+     *
+     * @param channel the archive.
+     * @param archiveName name of the archive, used for error messages only.
+     * @param encoding the encoding to use for file names, use null
+     * for the platform's default encoding
+     * @param useUnicodeExtraFields whether to use InfoZIP Unicode
+     * Extra Fields (if present) to set the file names.
+     * @param readOnlyCentralDirectory exclude reading whole file for extra meta information
+     *
+     * @throws IOException if an error occurs while reading the file.
+     * @since 1.13
+     */
+    public ZipFile(final SeekableByteChannel channel, final String archiveName,
+            final String encoding, final boolean useUnicodeExtraFields, final boolean readOnlyCentralDirectory)
+                    throws IOException {
+        this(channel, archiveName, encoding, useUnicodeExtraFields, false, readOnlyCentralDirectory);
     }
 
     private ZipFile(final SeekableByteChannel channel, final String archiveName,
                     final String encoding, final boolean useUnicodeExtraFields,
-                    final boolean closeOnError)
+                    final boolean closeOnError, final boolean readOnlyCentralDirectory)
         throws IOException {
         this.archiveName = archiveName;
         this.encoding = encoding;
         this.zipEncoding = ZipEncodingHelper.getZipEncoding(encoding);
         this.useUnicodeExtraFields = useUnicodeExtraFields;
+        this.readOnlyCentralDirectory = readOnlyCentralDirectory;
         archive = channel;
         boolean success = false;
         try {
             final Map<ZipArchiveEntry, NameAndComment> entriesWithoutUTF8Flag =
                 populateFromCentralDirectory();
-            resolveLocalFileHeaderData(entriesWithoutUTF8Flag);
+            if (!this.readOnlyCentralDirectory) {
+                resolveLocalFileHeaderData(entriesWithoutUTF8Flag);
+            }
             success = true;
         } finally {
             closed = !success;
@@ -480,7 +513,22 @@ public class ZipFile implements Closeable {
         }
         // cast validity is checked just above
         ZipUtil.checkRequestedFeatures(ze);
-        final long start = ze.getDataOffset();
+
+        final long start;
+        if (this.readOnlyCentralDirectory) {
+            // central directory and local file header does not match in length
+            archive.position(ze.getLocalHeaderOffset() + LFH_OFFSET_FOR_FILENAME_LENGTH);
+            wordBbuf.rewind();
+            IOUtils.readFully(archive, wordBbuf);
+            wordBbuf.flip();
+            wordBbuf.get(shortBuf);
+            final int fileNameLen = ZipShort.getValue(shortBuf);
+            wordBbuf.get(shortBuf);
+            final int extraFieldLen = ZipShort.getValue(shortBuf);
+            start = ze.getLocalHeaderOffset() + LFH_OFFSET_FOR_FILENAME_LENGTH + SHORT + SHORT + fileNameLen + extraFieldLen;
+        } else {
+            start = ze.getDataOffset();
+        }
 
         // doesn't get closed if the method is not supported - which
         // should never happen because of the checkRequestedFeatures
@@ -650,6 +698,7 @@ public class ZipFile implements Closeable {
     private void
         readCentralDirectoryEntry(final Map<ZipArchiveEntry, NameAndComment> noUTF8Flag)
         throws IOException {
+
         cfhBbuf.rewind();
         IOUtils.readFully(archive, cfhBbuf);
         int off = 0;
